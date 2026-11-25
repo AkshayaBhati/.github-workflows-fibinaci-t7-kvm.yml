@@ -1,0 +1,69 @@
+# Fibinaci T7, first part: the code sandbox in its hardened (KVM microVM) mode.
+# STATUS: written 24 Nov 2026 from the sandbox's README and docker-compose.yaml. NOT RUN YET. Result: test pending.
+#
+# How to use: put this file in any GitHub repository of ours at .github/workflows/fibinaci-t7-kvm.yml,
+# then Actions -> "Fibinaci T7 part 1" -> Run workflow. When it ends, download the "t7-evidence" artifact and send it to Akshaya.
+#
+# What it checks:
+#   1. The runner has KVM (/dev/kvm), which the sandbox's microVM mode needs.
+#   2. The sandbox builds and starts with KVM_ENABLED=true (its default).
+#   3. The sandbox's own test script passes against it.
+# What it does NOT check (needs our own code, so it belongs to C1):
+#   - "code calling a write is refused" at the Tool Checkpoint.
+#   - Speed. GitHub's runners are not the Intel C8i machines we will use, so no timing from here counts.
+name: Fibinaci T7 part 1 - code sandbox on KVM
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t7:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SANDBOX_COMMIT: c7bf37d6977dffcccc687e29c0b1514036c24e63   # ClickHouse/code-interpreter main, 17 Nov 2026
+    steps:
+      - name: Let the runner user use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: 1. Is KVM here?
+        run: |
+          mkdir -p evidence
+          { echo "date: $(date -u)"; echo "kernel: $(uname -r)"; echo "cpu: $(grep -m1 'model name' /proc/cpuinfo)";
+            echo "cpus: $(nproc)"; echo "memory: $(free -g | awk '/Mem/{print $2}') GB"; ls -l /dev/kvm; } | tee evidence/1_machine.txt
+          test -c /dev/kvm
+      - name: Get the sandbox at the pinned commit
+        run: |
+          git clone https://github.com/ClickHouse/code-interpreter sandbox
+          git -C sandbox checkout "$SANDBOX_COMMIT"
+          git -C sandbox log -1 --format='%H %cs' | tee evidence/2_commit.txt
+      - name: 2. Build and start it in KVM mode
+        working-directory: sandbox
+        run: |
+          export KVM_ENABLED=true
+          docker compose up --build -d 2>&1 | tail -40
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://localhost:2000/ 2>/dev/null || [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:2000/)" != "000" ]; then echo "sandbox answering after $((i*10)) s"; break; fi
+            sleep 10
+          done
+          docker compose ps | tee ../evidence/3_services.txt
+      - name: 3. Run the sandbox's own tests
+        working-directory: sandbox
+        run: |
+          sudo apt-get install -y -qq jq >/dev/null
+          set -o pipefail
+          SANDBOX_URL=http://localhost:2000 ./test-sandbox.sh 2>&1 | tee ../evidence/4_test_sandbox.txt
+      - name: Save the logs
+        if: always()
+        working-directory: sandbox
+        run: |
+          docker compose logs --no-color sandbox-runner > ../evidence/5_sandbox_runner.log 2>&1 || true
+          docker compose logs --no-color > ../evidence/6_all_services.log 2>&1 || true
+          grep -i -m5 "kvm\|libkrun\|microvm" ../evidence/5_sandbox_runner.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7-evidence
+          path: evidence/
