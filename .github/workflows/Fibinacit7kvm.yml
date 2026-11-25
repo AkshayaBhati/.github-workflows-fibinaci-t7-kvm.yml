@@ -1,0 +1,146 @@
+# Fibinaci T7, first part: the code sandbox in its hardened (KVM microVM) mode.
+# Version 3, 25 Nov 2026.
+# Run 1: KVM was on the runner, the sandbox never started, and the start-up output wasn't saved.
+# Run 2: the project's published images were found, but the pull stopped because the object-store image the
+#        sandbox's compose file names (quay.io/minio/minio) can't be pulled without a login.
+# This version tries other public images for that object store, and if none can be pulled it starts the
+# sandbox runner without it, because the sandbox's own tests only talk to the runner.
+# STATUS: NOT RUN YET in this form. Result: test pending.
+#
+# How to use: replace the contents of .github/workflows/fibinaci-t7-kvm.yml with this file, commit,
+# then Actions -> "Fibinaci T7 part 1" -> Run workflow (once). Download the "t7-evidence" artifact when it ends, green or red.
+#
+# What it checks:
+#   1. The runner has KVM (/dev/kvm).
+#   2. The sandbox starts with KVM_ENABLED=true (its default).
+#   3. The sandbox's own test script passes against it.
+# What it does NOT check: "code calling a write is refused" (needs our Tool Checkpoint, C1), and speed.
+name: Fibinaci T7 part 1 - code sandbox on KVM
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t7:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SANDBOX_COMMIT: c7bf37d6977dffcccc687e29c0b1514036c24e63   # ClickHouse/code-interpreter main, 17 Nov 2026
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Let the runner user use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: 1. Is KVM here?
+        run: |
+          mkdir -p evidence
+          { echo "date: $(date -u)"; echo "kernel: $(uname -r)"; echo "cpu: $(grep -m1 'model name' /proc/cpuinfo)";
+            echo "cpus: $(nproc)"; echo "memory: $(free -g | awk '/Mem/{print $2}') GB"; ls -l /dev/kvm;
+            echo "docker: $(docker --version)"; echo "compose: $(docker compose version)"; } | tee evidence/1_machine.txt
+          test -c /dev/kvm
+      - name: Get the sandbox at the pinned commit
+        run: |
+          git clone https://github.com/ClickHouse/code-interpreter sandbox
+          git -C sandbox checkout "$SANDBOX_COMMIT"
+          git -C sandbox log -1 --format='%H %cs' | tee evidence/2_commit.txt
+      - name: 2a. Find published images, or build from source
+        working-directory: sandbox
+        run: |
+          cat > docker-compose.images.yml <<'YAML'
+          services:
+            api:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-api:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+            service-worker:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-worker:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+            file_server:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-file-server:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+            egress_gateway:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-egress-gateway:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+            tool_call_server:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-tool-call-server:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+            sandbox-runner:
+              build: !reset null
+              image: ghcr.io/librechat-ai/code-interpreter-sandbox-runner:${CODEAPI_IMAGE_TAG:?set CODEAPI_IMAGE_TAG}
+              pull_policy: missing
+          YAML
+          MODE=build; TAG=""
+          for t in "sha-$SANDBOX_COMMIT" "sha-${SANDBOX_COMMIT:0:7}" "main"; do
+            if docker manifest inspect "ghcr.io/librechat-ai/code-interpreter-sandbox-runner:$t" >/dev/null 2>>../evidence/3_image_lookup.txt; then MODE=images; TAG="$t"; break; fi
+            echo "no published image with tag $t" | tee -a ../evidence/3_image_lookup.txt
+          done
+          echo "mode: $MODE  tag: ${TAG:-none}" | tee -a ../evidence/3_image_lookup.txt
+          echo "T7_MODE=$MODE" >> "$GITHUB_ENV"; echo "CODEAPI_IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "CODEAPI_BRIDGE_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "KVM_ENABLED=true" >> "$GITHUB_ENV"
+      - name: 2a2. Find an object-store image that can be pulled
+        working-directory: sandbox
+        run: |
+          MINIO=""
+          for img in quay.io/minio/minio minio/minio:latest cgr.dev/chainguard/minio:latest ghcr.io/coollabsio/minio:latest bitnamilegacy/minio:latest; do
+            if docker pull -q "$img" >/dev/null 2>>../evidence/3b_minio_lookup.txt; then MINIO="$img"; break; fi
+            echo "could not pull $img" | tee -a ../evidence/3b_minio_lookup.txt
+          done
+          echo "object store image: ${MINIO:-none}" | tee -a ../evidence/3b_minio_lookup.txt
+          echo "T7_MINIO=$MINIO" >> "$GITHUB_ENV"
+          if [ -n "$MINIO" ]; then printf 'services:\n  minio:\n    image: %s\n' "$MINIO" > docker-compose.minio.yml; fi
+      - name: 2b. Start it in KVM mode
+        working-directory: sandbox
+        run: |
+          set -o pipefail
+          if [ "$T7_MODE" = images ]; then FILES="-f docker-compose.yaml -f docker-compose.images.yml"; else FILES="-f docker-compose.yaml"; fi
+          if [ -n "$T7_MINIO" ]; then FILES="$FILES -f docker-compose.minio.yml"; fi
+          echo "COMPOSE_FILES=$FILES" >> "$GITHUB_ENV"
+          docker compose $FILES config > ../evidence/4_compose_config.yaml 2> ../evidence/4_compose_config_errors.txt || { cat ../evidence/4_compose_config_errors.txt; exit 1; }
+          if [ -n "$T7_MINIO" ]; then WHAT=""; NODEPS=""; else WHAT="sandbox-runner"; NODEPS="--no-deps"; echo "no object store: starting the sandbox runner alone" | tee ../evidence/6_up.log; fi
+          if [ "$T7_MODE" = images ]; then
+            docker compose $FILES pull $WHAT 2>&1 | tee ../evidence/5_pull.log | tail -30
+          else
+            docker compose $FILES build $WHAT 2>&1 | tee ../evidence/5_build.log | tail -60
+          fi
+          docker compose $FILES up -d $NODEPS $WHAT 2>&1 | tee -a ../evidence/6_up.log
+      - name: 2c. Wait for the sandbox to answer
+        working-directory: sandbox
+        run: |
+          UP=no
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://localhost:2000/ || true)
+            if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then UP=yes; echo "sandbox answered HTTP $CODE after $((i*10)) s" | tee ../evidence/7_ready.txt; break; fi
+            sleep 10
+          done
+          docker compose $COMPOSE_FILES ps -a | tee ../evidence/8_services.txt
+          if [ "$UP" != yes ]; then echo "the sandbox did not answer on port 2000 within 10 minutes" | tee ../evidence/7_ready.txt; exit 1; fi
+      - name: 3. Run the sandbox's own tests
+        working-directory: sandbox
+        run: |
+          set -o pipefail
+          sudo apt-get install -y -qq jq >/dev/null
+          SANDBOX_URL=http://localhost:2000 ./test-sandbox.sh 2>&1 | tee ../evidence/9_test_sandbox.txt
+      - name: Save the logs
+        if: always()
+        working-directory: sandbox
+        run: |
+          F="${COMPOSE_FILES:--f docker-compose.yaml}"
+          docker compose $F ps -a > ../evidence/8_services_final.txt 2>&1 || true
+          for s in sandbox-runner api service-worker egress_gateway tool_call_server file_server; do
+            docker compose $F logs --no-color --tail 400 "$s" > "../evidence/log_$s.txt" 2>&1 || true
+          done
+          grep -i -m8 "kvm\|libkrun\|microvm" ../evidence/log_sandbox-runner.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t7-evidence
+          path: evidence/
