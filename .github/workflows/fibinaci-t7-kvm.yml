@@ -1,7 +1,10 @@
 # Fibinaci T7, first part: the code sandbox in its hardened (KVM microVM) mode.
-# Version 2, 25 Nov 2026. The first run (25 Nov) found KVM on the runner, but the sandbox never started and the
-# start-up output wasn't saved. This version saves everything, uses the project's published images first
-# (as its README describes), and only builds from source if they can't be pulled.
+# Version 3, 25 Nov 2026.
+# Run 1: KVM was on the runner, the sandbox never started, and the start-up output wasn't saved.
+# Run 2: the project's published images were found, but the pull stopped because the object-store image the
+#        sandbox's compose file names (quay.io/minio/minio) can't be pulled without a login.
+# This version tries other public images for that object store, and if none can be pulled it starts the
+# sandbox runner without it, because the sandbox's own tests only talk to the runner.
 # STATUS: NOT RUN YET in this form. Result: test pending.
 #
 # How to use: replace the contents of .github/workflows/fibinaci-t7-kvm.yml with this file, commit,
@@ -83,19 +86,32 @@ jobs:
           echo "T7_MODE=$MODE" >> "$GITHUB_ENV"; echo "CODEAPI_IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "CODEAPI_BRIDGE_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
           echo "KVM_ENABLED=true" >> "$GITHUB_ENV"
+      - name: 2a2. Find an object-store image that can be pulled
+        working-directory: sandbox
+        run: |
+          MINIO=""
+          for img in quay.io/minio/minio minio/minio:latest cgr.dev/chainguard/minio:latest ghcr.io/coollabsio/minio:latest bitnamilegacy/minio:latest; do
+            if docker pull -q "$img" >/dev/null 2>>../evidence/3b_minio_lookup.txt; then MINIO="$img"; break; fi
+            echo "could not pull $img" | tee -a ../evidence/3b_minio_lookup.txt
+          done
+          echo "object store image: ${MINIO:-none}" | tee -a ../evidence/3b_minio_lookup.txt
+          echo "T7_MINIO=$MINIO" >> "$GITHUB_ENV"
+          if [ -n "$MINIO" ]; then printf 'services:\n  minio:\n    image: %s\n' "$MINIO" > docker-compose.minio.yml; fi
       - name: 2b. Start it in KVM mode
         working-directory: sandbox
         run: |
           set -o pipefail
           if [ "$T7_MODE" = images ]; then FILES="-f docker-compose.yaml -f docker-compose.images.yml"; else FILES="-f docker-compose.yaml"; fi
+          if [ -n "$T7_MINIO" ]; then FILES="$FILES -f docker-compose.minio.yml"; fi
           echo "COMPOSE_FILES=$FILES" >> "$GITHUB_ENV"
           docker compose $FILES config > ../evidence/4_compose_config.yaml 2> ../evidence/4_compose_config_errors.txt || { cat ../evidence/4_compose_config_errors.txt; exit 1; }
+          if [ -n "$T7_MINIO" ]; then WHAT=""; NODEPS=""; else WHAT="sandbox-runner"; NODEPS="--no-deps"; echo "no object store: starting the sandbox runner alone" | tee ../evidence/6_up.log; fi
           if [ "$T7_MODE" = images ]; then
-            docker compose $FILES pull 2>&1 | tee ../evidence/5_pull.log | tail -30
+            docker compose $FILES pull $WHAT 2>&1 | tee ../evidence/5_pull.log | tail -30
           else
-            docker compose $FILES build 2>&1 | tee ../evidence/5_build.log | tail -60
+            docker compose $FILES build $WHAT 2>&1 | tee ../evidence/5_build.log | tail -60
           fi
-          docker compose $FILES up -d 2>&1 | tee ../evidence/6_up.log
+          docker compose $FILES up -d $NODEPS $WHAT 2>&1 | tee -a ../evidence/6_up.log
       - name: 2c. Wait for the sandbox to answer
         working-directory: sandbox
         run: |
